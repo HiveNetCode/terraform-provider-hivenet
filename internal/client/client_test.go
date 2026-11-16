@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -144,5 +145,71 @@ func TestListPresetsFiltersAndFollowsCursor(t *testing.T) {
 	}
 	if len(got) != 2 || got[0].HourlyPrice != "3.2000" || got[1].ID != "p2" {
 		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestCreateInstance(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/instances" {
+			t.Errorf("%s %s", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("Content-Type = %q", got)
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]string{"name": "web", "preset_id": "p1", "image_type": "vm", "image_id": "ubuntu24.04"}
+		for k, v := range want {
+			if body[k] != v {
+				t.Errorf("body[%q] = %q, want %q", k, body[k], v)
+			}
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"instance":{"instance_id":"a","name":"web","status":0}}`))
+	})
+
+	got, err := c.CreateInstance(t.Context(), CreateInstanceRequest{Name: "web", PresetID: "p1", ImageType: "vm", ImageID: "ubuntu24.04"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "a" || got.Status != "CREATED" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestCreateInstanceNotRetriedOnServerError(t *testing.T) {
+	calls := 0
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+
+	_, err := c.CreateInstance(t.Context(), CreateInstanceRequest{Name: "web"})
+	if !IsCreateOutcomeUnknown(err) {
+		t.Fatalf("err = %v, want an unknown outcome", err)
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1", calls)
+	}
+}
+
+func TestIsCreateOutcomeUnknown(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{&APIError{StatusCode: http.StatusInternalServerError}, true},
+		{&APIError{StatusCode: http.StatusGatewayTimeout}, true},
+		{&APIError{StatusCode: http.StatusConflict}, false},
+		{&APIError{StatusCode: http.StatusNotFound}, false},
+		{errors.New("connection reset"), true},
+		{context.Canceled, false},
+	} {
+		if got := IsCreateOutcomeUnknown(tc.err); got != tc.want {
+			t.Errorf("IsCreateOutcomeUnknown(%v) = %v, want %v", tc.err, got, tc.want)
+		}
 	}
 }

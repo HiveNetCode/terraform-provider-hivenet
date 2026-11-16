@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -36,7 +37,11 @@ const (
 	// A start can take 15 minutes, plus up to 5 to attach storage.
 	defaultPowerTimeout     = 20 * time.Minute
 	defaultTerminateTimeout = 20 * time.Minute
+	// A create adds scheduling and the image pull to a start.
+	defaultCreateTimeout = 30 * time.Minute
 )
+
+var instanceNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // pollInterval is how often waits re-read the instance. Unit tests shorten it.
 var pollInterval = 10 * time.Second
@@ -44,6 +49,7 @@ var pollInterval = 10 * time.Second
 var (
 	_ resource.ResourceWithConfigure   = &instanceResource{}
 	_ resource.ResourceWithImportState = &instanceResource{}
+	_ resource.ResourceWithModifyPlan  = &instanceResource{}
 )
 
 func NewInstanceResource() resource.Resource {
@@ -60,6 +66,9 @@ type instanceResourceModel struct {
 	ID            types.String   `tfsdk:"id"`
 	PowerState    types.String   `tfsdk:"power_state"`
 	Name          types.String   `tfsdk:"name"`
+	PresetID      types.String   `tfsdk:"preset_id"`
+	ImageType     types.String   `tfsdk:"image_type"`
+	ImageID       types.String   `tfsdk:"image_id"`
 	Status        types.String   `tfsdk:"status"`
 	Location      types.String   `tfsdk:"location"`
 	GPUType       types.String   `tfsdk:"gpu_type"`
@@ -94,11 +103,12 @@ func (r *instanceResource) Schema(ctx context.Context, req resource.SchemaReques
 		}
 	}
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "Manages the power state of an existing instance.\n\n" +
-			"The public API cannot create instances yet, so this resource only works on instances you " +
-			"[import](#import). Applying a configuration for an instance that is not imported fails.\n\n" +
-			"~> **Destroying this resource terminates the instance and permanently deletes its disk.** " +
-			"Use `power_state = \"stopped\"` to pause billing instead, and consider `lifecycle { prevent_destroy = true }`.\n\n" +
+		MarkdownDescription: "Creates an instance, or manages one you [import](#import), and sets its power state.\n\n" +
+			"~> **Every change except `power_state` replaces the instance**: Terraform terminates it, deleting its disk, " +
+			"and creates a new one with a new ID. The API cannot update an instance in place yet. " +
+			"Consider `lifecycle { prevent_destroy = true }`, and use `power_state = \"stopped\"` to pause billing.\n\n" +
+			"The instance gets the SSH key registered last on your account, in the console or through the API. " +
+			"Without one, create fails. Connection details are not in the API yet: find them in the Hive Compute console.\n\n" +
 			"If Hive terminates the instance on its own, for example after it has been stopped for 10 days, " +
 			"the next refresh removes it from state with a warning.",
 		Attributes: map[string]schema.Attribute{
@@ -112,7 +122,27 @@ func (r *instanceResource) Schema(ctx context.Context, req resource.SchemaReques
 				Validators:    []validator.String{stringvalidator.OneOf(powerStateRunning, powerStateStopped)},
 				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
-			"name": stable("Display name."),
+			"name": schema.StringAttribute{
+				MarkdownDescription: "Display name: letters, digits, hyphens and underscores. Required to create. " +
+					"Names are not unique. Changing it replaces the instance.",
+				Optional: true,
+				Computed: true,
+				Validators: []validator.String{
+					stringvalidator.LengthBetween(1, 255),
+					stringvalidator.RegexMatches(instanceNamePattern, "must contain only letters, digits, hyphens and underscores"),
+				},
+				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown(), stringplanmodifier.RequiresReplace()},
+			},
+			"preset_id": createOnly("ID of the preset to create the instance from, from the `hivenet_presets` data source. " +
+				"It sets the location, hardware and price. Required to create."),
+			"image_type": schema.StringAttribute{
+				MarkdownDescription: "`vm` or `container`. Required to create. " + createOnlyNote,
+				Optional:            true,
+				Validators:          []validator.String{stringvalidator.OneOf("vm", "container")},
+				PlanModifiers:       []planmodifier.String{replaceOnChange()},
+			},
+			"image_id": createOnly("ID of the image, e.g. `ubuntu24.04`. It must suit the preset: a GPU preset needs a GPU image. " +
+				"Windows images cannot be created through the API yet. Required to create."),
 			"status": schema.StringAttribute{
 				MarkdownDescription: "Lifecycle state, e.g. `RUNNING` or `STOPPED`. `PAUSED` means the host is unreachable; " +
 					"`ERRORED` means the instance failed to start or crashed. Both count as `running` for `power_state`.",
@@ -141,8 +171,10 @@ func (r *instanceResource) Schema(ctx context.Context, req resource.SchemaReques
 		},
 		Blocks: map[string]schema.Block{
 			"timeouts": timeouts.Block(ctx, timeouts.Opts{
+				Create:            true,
 				Update:            true,
 				Delete:            true,
+				CreateDescription: "How long to wait for a new instance to reach `RUNNING`. Defaults to `30m`.",
 				UpdateDescription: "How long to wait for a start or stop. Defaults to `20m`.",
 				DeleteDescription: "How long to wait for termination. Defaults to `20m`.",
 			}),
@@ -154,10 +186,130 @@ func (r *instanceResource) Configure(ctx context.Context, req resource.Configure
 	r.client = configureClient(req.ProviderData, &resp.Diagnostics)
 }
 
+// ModifyPlan requires the create arguments when the plan creates the instance.
+// They are optional otherwise, so an imported instance needs none of them.
+func (r *instanceResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if !req.State.Raw.IsNull() || req.Plan.Raw.IsNull() {
+		return
+	}
+	var config instanceResourceModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	for attr, v := range map[string]types.String{
+		"name": config.Name, "preset_id": config.PresetID, "image_type": config.ImageType, "image_id": config.ImageID,
+	} {
+		if v.IsNull() {
+			resp.Diagnostics.AddAttributeError(path.Root(attr), "Missing argument to create an instance",
+				fmt.Sprintf("%q is required to create an instance. To manage an existing instance instead, import it.", attr))
+		}
+	}
+}
+
 func (r *instanceResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
-	resp.Diagnostics.AddError("Creating instances is not supported yet",
-		"The public API has no create endpoint yet. Import an existing instance instead, with an import block "+
-			"or `terraform import hivenet_instance.<name> <instance id>`.")
+	if !requireClient(r.client, &resp.Diagnostics) {
+		return
+	}
+	var plan instanceResourceModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	timeout, diags := plan.Timeouts.Create(ctx, defaultCreateTimeout)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	body := client.CreateInstanceRequest{
+		Name:      plan.Name.ValueString(),
+		PresetID:  plan.PresetID.ValueString(),
+		ImageType: plan.ImageType.ValueString(),
+		ImageID:   plan.ImageID.ValueString(),
+	}
+	stopAfter := plan.PowerState.ValueString() == powerStateStopped
+	inst, err := r.createInstance(ctx, body)
+	if err != nil {
+		resp.Diagnostics.AddError("Creating instance", err.Error())
+		return
+	}
+
+	// Save the ID before waiting, so a failed wait leaves the instance in
+	// state, tainted, instead of billing untracked.
+	if got, err := r.client.GetInstance(ctx, inst.ID); err == nil {
+		inst = got
+	}
+	setFromInstance(&plan, inst)
+	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	inst, err = waitForStatus(ctx, r.client, inst.ID, statusRunning, timeout)
+	if err == nil && stopAfter {
+		inst, err = r.setPowerState(ctx, plan.ID.ValueString(), powerStateStopped, timeout)
+	}
+	if err != nil {
+		resp.Diagnostics.AddError("Waiting for the new instance", err.Error())
+		return
+	}
+	setFromInstance(&plan, inst)
+	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+}
+
+// createInstance creates the instance. When the API cannot say whether it did,
+// it looks for an instance with the same name that was not there before, so a
+// retry never leaves a second billed instance behind.
+func (r *instanceResource) createInstance(ctx context.Context, body client.CreateInstanceRequest) (*client.Instance, error) {
+	existing, err := r.client.ListInstances(ctx, client.ListInstancesOptions{FreeTextSearch: body.Name})
+	if err != nil {
+		return nil, fmt.Errorf("listing instances before the create: %w", err)
+	}
+	before := map[string]bool{}
+	for _, inst := range existing {
+		before[inst.ID] = true
+	}
+
+	inst, err := r.client.CreateInstance(ctx, body)
+	switch {
+	case err == nil:
+		return inst, nil
+	case client.IsStatus(err, http.StatusNotFound):
+		return nil, fmt.Errorf("%w\n\nThe preset or image does not exist, the preset's location does not offer the image, "+
+			"or the account has no SSH key registered", err)
+	case client.IsStatus(err, http.StatusConflict):
+		return nil, fmt.Errorf("%w\n\nNothing was created: the account lacks credit, the preset is sold out in its location, "+
+			"or the preset changed during the call. Retry later or pick another preset", err)
+	case !client.IsCreateOutcomeUnknown(err):
+		return nil, err
+	}
+
+	after, listErr := r.client.ListInstances(ctx, client.ListInstancesOptions{FreeTextSearch: body.Name})
+	if listErr != nil {
+		return nil, fmt.Errorf("%w\n\nThe instance may have been created, and checking failed: %v. "+
+			"Look for an instance named %q before applying again", err, listErr, body.Name)
+	}
+	var created []client.Instance
+	for _, inst := range after {
+		if inst.Name == body.Name && !before[inst.ID] && inst.Status != statusTerminating && inst.Status != statusTerminated {
+			created = append(created, inst)
+		}
+	}
+	switch len(created) {
+	case 0:
+		return nil, fmt.Errorf("%w\n\nNo instance was created; it is safe to apply again", err)
+	case 1:
+		return &created[0], nil
+	}
+	ids := make([]string, len(created))
+	for i, inst := range created {
+		ids[i] = inst.ID
+	}
+	return nil, fmt.Errorf("%w\n\nThe outcome is unknown and several new instances are named %q: %s. "+
+		"Import the right one, or terminate the extras", err, body.Name, strings.Join(ids, ", "))
 }
 
 func (r *instanceResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
@@ -332,6 +484,29 @@ func waitForStatus(ctx context.Context, c *client.Client, id string, target clie
 		case <-time.After(pollInterval):
 		}
 	}
+}
+
+const createOnlyNote = "Not returned by the API, so it is empty after an import, and setting it then does not replace the instance. " +
+	"Changing it later replaces the instance."
+
+func createOnly(desc string) schema.StringAttribute {
+	return schema.StringAttribute{
+		MarkdownDescription: desc + " " + createOnlyNote,
+		Optional:            true,
+		PlanModifiers:       []planmodifier.String{replaceOnChange()},
+	}
+}
+
+// replaceOnChange replaces the instance when a create argument changes, but
+// not when it is first set on an imported instance or removed from config.
+func replaceOnChange() planmodifier.String {
+	return stringplanmodifier.RequiresReplaceIf(
+		func(ctx context.Context, req planmodifier.StringRequest, resp *stringplanmodifier.RequiresReplaceIfFuncResponse) {
+			resp.RequiresReplace = !req.StateValue.IsNull() && !req.PlanValue.IsNull()
+		},
+		"Changing it replaces the instance.",
+		"Changing it replaces the instance.",
+	)
 }
 
 // powerStateOf maps a status to the power state it implies: pending, ERRORED

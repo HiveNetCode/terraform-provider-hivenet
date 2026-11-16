@@ -50,9 +50,19 @@ func GPUPreset(t testing.TB) string {
 	return requireEnv(t, "HIVENET_ACC_GPU_PRESET")
 }
 
+// Image returns the image acceptance tests create instances from:
+// HIVENET_ACC_IMAGE_TYPE and HIVENET_ACC_IMAGE_ID, or an Ubuntu VM.
+func Image() (imageType, imageID string) {
+	imageType, imageID = os.Getenv("HIVENET_ACC_IMAGE_TYPE"), os.Getenv("HIVENET_ACC_IMAGE_ID")
+	if imageType == "" || imageID == "" {
+		return "vm", "ubuntu24.04"
+	}
+	return imageType, imageID
+}
+
 // FixtureInstanceID skips t unless HIVENET_ACC_INSTANCE_ID is set, then
 // returns it. It names a long-lived instance in the test org that tests import
-// and start or stop but never destroy, until hivenet_instance can create its own.
+// and start or stop but never destroy.
 func FixtureInstanceID(t testing.TB) string {
 	t.Helper()
 	id := os.Getenv("HIVENET_ACC_INSTANCE_ID")

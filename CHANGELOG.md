@@ -6,4 +6,4 @@ FEATURES:
 * **New Data Source:** `hivenet_regions`
 * **New Data Source:** `hivenet_presets`
 * **New Data Source:** `hivenet_instance`
-* **New Resource:** `hivenet_instance`: import an existing instance, set `power_state`, destroy. Creating instances is not supported yet
+* **New Resource:** `hivenet_instance`: create from a preset and image, or import an existing instance; set `power_state`, destroy. Every other change replaces the instance

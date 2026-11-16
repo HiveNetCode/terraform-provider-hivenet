@@ -3,31 +3,38 @@
 page_title: "hivenet_instance Resource - hivenet"
 subcategory: ""
 description: |-
-  Manages the power state of an existing instance.
-  The public API cannot create instances yet, so this resource only works on instances you import. Applying a configuration for an instance that is not imported fails.
-  ~> Destroying this resource terminates the instance and permanently deletes its disk. Use power_state = "stopped" to pause billing instead, and consider lifecycle { prevent_destroy = true }.
+  Creates an instance, or manages one you import, and sets its power state.
+  ~> Every change except power_state replaces the instance: Terraform terminates it, deleting its disk, and creates a new one with a new ID. The API cannot update an instance in place yet. Consider lifecycle { prevent_destroy = true }, and use power_state = "stopped" to pause billing.
+  The instance gets the SSH key registered last on your account, in the console or through the API. Without one, create fails. Connection details are not in the API yet: find them in the Hive Compute console.
   If Hive terminates the instance on its own, for example after it has been stopped for 10 days, the next refresh removes it from state with a warning.
 ---
 
 # hivenet_instance (Resource)
 
-Manages the power state of an existing instance.
+Creates an instance, or manages one you [import](#import), and sets its power state.
 
-The public API cannot create instances yet, so this resource only works on instances you [import](#import). Applying a configuration for an instance that is not imported fails.
+~> **Every change except `power_state` replaces the instance**: Terraform terminates it, deleting its disk, and creates a new one with a new ID. The API cannot update an instance in place yet. Consider `lifecycle { prevent_destroy = true }`, and use `power_state = "stopped"` to pause billing.
 
-~> **Destroying this resource terminates the instance and permanently deletes its disk.** Use `power_state = "stopped"` to pause billing instead, and consider `lifecycle { prevent_destroy = true }`.
+The instance gets the SSH key registered last on your account, in the console or through the API. Without one, create fails. Connection details are not in the API yet: find them in the Hive Compute console.
 
 If Hive terminates the instance on its own, for example after it has been stopped for 10 days, the next refresh removes it from state with a warning.
 
 ## Example Usage
 
 ```terraform
-# Import the instance first; see Import below.
+data "hivenet_presets" "rtx4090_fr" {
+  region           = "FR"
+  free_text_search = "RTX 4090"
+}
+
 resource "hivenet_instance" "web" {
-  power_state = "stopped"
+  name       = "web-1"
+  preset_id  = data.hivenet_presets.rtx4090_fr.presets[0].id
+  image_type = "vm"
+  image_id   = "ubuntu24.04"
 
   lifecycle {
-    # Destroying this resource terminates the instance and deletes its disk.
+    # Any change except power_state replaces the instance and deletes its disk.
     prevent_destroy = true
   }
 }
@@ -38,7 +45,11 @@ resource "hivenet_instance" "web" {
 
 ### Optional
 
+- `image_id` (String) ID of the image, e.g. `ubuntu24.04`. It must suit the preset: a GPU preset needs a GPU image. Windows images cannot be created through the API yet. Required to create. Not returned by the API, so it is empty after an import, and setting it then does not replace the instance. Changing it later replaces the instance.
+- `image_type` (String) `vm` or `container`. Required to create. Not returned by the API, so it is empty after an import, and setting it then does not replace the instance. Changing it later replaces the instance.
+- `name` (String) Display name: letters, digits, hyphens and underscores. Required to create. Names are not unique. Changing it replaces the instance.
 - `power_state` (String) `running` or `stopped`. Changing it starts or stops the instance and waits for it to settle. Leave it unset to only track the instance. An instance Hive stopped on its own, for example when credits ran out, shows up as a change back to `running`.
+- `preset_id` (String) ID of the preset to create the instance from, from the `hivenet_presets` data source. It sets the location, hardware and price. Required to create. Not returned by the API, so it is empty after an import, and setting it then does not replace the instance. Changing it later replaces the instance.
 - `timeouts` (Block, Optional) (see [below for nested schema](#nestedblock--timeouts))
 
 ### Read-Only
@@ -50,7 +61,6 @@ resource "hivenet_instance" "web" {
 - `hourly_rate` (Number) Price per hour while running, in credits.
 - `id` (String) Instance ID (UUID).
 - `location` (String) Datacenter the instance runs in, e.g. `france-2`.
-- `name` (String) Display name.
 - `resources` (String) Human-readable summary of the allocated hardware.
 - `size` (String) Headline shape, e.g. `8 x GPU`.
 - `started_at` (String) When the instance last entered `RUNNING` (RFC 3339). Null if it never has.
@@ -62,6 +72,7 @@ resource "hivenet_instance" "web" {
 
 Optional:
 
+- `create` (String) How long to wait for a new instance to reach `RUNNING`. Defaults to `30m`.
 - `delete` (String) How long to wait for termination. Defaults to `20m`.
 - `update` (String) How long to wait for a start or stop. Defaults to `20m`.
 
