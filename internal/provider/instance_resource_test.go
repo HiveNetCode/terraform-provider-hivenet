@@ -577,6 +577,39 @@ func TestInstanceResource_createSoldOut(t *testing.T) {
 	})
 }
 
+func TestInstanceResource_createForbidden(t *testing.T) {
+	f, endpoint := newFakeInstanceAPI(t, nil)
+	f.failNextCreate(http.StatusForbidden, false)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config:      fakeProviderConfig(endpoint) + createConfig("web-1", "ubuntu24.04", "running"),
+				ExpectError: regexp.MustCompile(`(?s)Nothing was created.*cannot use the location of preset\s+` + fakePresetID),
+			},
+		},
+	})
+}
+
+func TestInstanceResource_presetIDNotUUID(t *testing.T) {
+	f, endpoint := newFakeInstanceAPI(t, nil)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: fakeProviderConfig(endpoint) + strings.Replace(
+					createConfig("web-1", "ubuntu24.04", "running"), fakePresetID, "PRESET_ID", 1),
+				ExpectError: regexp.MustCompile(`must be a preset ID \(a UUID\)`),
+			},
+		},
+	})
+	if log := f.actionLog(); len(log) != 0 {
+		t.Errorf("API actions %v, want none: the ID must be rejected at plan time", log)
+	}
+}
+
 func TestInstanceResource_importedThenCreateArguments(t *testing.T) {
 	fastPolling(t)
 	_, endpoint := newFakeInstanceAPI(t, map[string]string{fakeID: "RUNNING"})

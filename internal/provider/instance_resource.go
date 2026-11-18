@@ -41,7 +41,10 @@ const (
 	defaultCreateTimeout = 30 * time.Minute
 )
 
-var instanceNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+var (
+	instanceNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	uuidPattern         = regexp.MustCompile(`^(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+)
 
 // pollInterval is how often waits re-read the instance. Unit tests shorten it.
 var pollInterval = 10 * time.Second
@@ -133,8 +136,9 @@ func (r *instanceResource) Schema(ctx context.Context, req resource.SchemaReques
 				},
 				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown(), stringplanmodifier.RequiresReplace()},
 			},
-			"preset_id": createOnly("ID of the preset to create the instance from, from the `hivenet_presets` data source. " +
-				"It sets the location, hardware and price. Required to create."),
+			"preset_id": createOnly("ID of the preset to create the instance from, from the `hivenet_presets` data source. "+
+				"It sets the location, hardware and price. Required to create.",
+				stringvalidator.RegexMatches(uuidPattern, "must be a preset ID (a UUID) from the hivenet_presets data source")),
 			"image_type": schema.StringAttribute{
 				MarkdownDescription: "`vm` or `container`. Required to create. " + createOnlyNote,
 				Optional:            true,
@@ -281,6 +285,9 @@ func (r *instanceResource) createInstance(ctx context.Context, body client.Creat
 	case client.IsStatus(err, http.StatusNotFound):
 		return nil, fmt.Errorf("%w\n\nThe preset or image does not exist, the preset's location does not offer the image, "+
 			"or the account has no SSH key registered", err)
+	case client.IsStatus(err, http.StatusForbidden):
+		return nil, fmt.Errorf("%w\n\nNothing was created: the account cannot use the location of preset %s, "+
+			"or cannot create instances now, for example because it is suspended. Try a preset in another location", err, body.PresetID)
 	case client.IsStatus(err, http.StatusConflict):
 		return nil, fmt.Errorf("%w\n\nNothing was created: the account lacks credit, the preset is sold out in its location, "+
 			"or the preset changed during the call. Retry later or pick another preset", err)
@@ -493,11 +500,12 @@ func waitForStatus(ctx context.Context, c *client.Client, id string, target clie
 const createOnlyNote = "Not returned by the API, so it is empty after an import, and setting it then does not replace the instance. " +
 	"Changing it later replaces the instance; removing it from the configuration keeps the value."
 
-func createOnly(desc string) schema.StringAttribute {
+func createOnly(desc string, validators ...validator.String) schema.StringAttribute {
 	return schema.StringAttribute{
 		MarkdownDescription: desc + " " + createOnlyNote,
 		Optional:            true,
 		Computed:            true,
+		Validators:          validators,
 		PlanModifiers:       []planmodifier.String{stringplanmodifier.UseStateForUnknown(), replaceOnChange()},
 	}
 }
