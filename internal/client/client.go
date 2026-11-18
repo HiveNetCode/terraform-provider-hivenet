@@ -2,6 +2,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -62,6 +63,14 @@ type Instance struct {
 	TerminationReason *TerminationReason `json:"termination_reason"`
 	GuestReady        GuestReady         `json:"guest_ready"`
 	GuestReadyReason  string             `json:"guest_ready_reason"`
+}
+
+// CreateInstanceRequest is the body of POST /instances.
+type CreateInstanceRequest struct {
+	Name      string `json:"name"`
+	PresetID  string `json:"preset_id"`
+	ImageType string `json:"image_type"`
+	ImageID   string `json:"image_id"`
 }
 
 // ListInstancesOptions filters ListInstances. Zero values mean no filter.
@@ -129,6 +138,34 @@ func (c *Client) GetInstance(ctx context.Context, id string) (*Instance, error) 
 	return &inst, nil
 }
 
+// CreateInstance creates and starts an instance. Creates are not idempotent:
+// it never retries, and a 5xx or transport error leaves the outcome
+// unknown, which IsCreateOutcomeUnknown reports.
+func (c *Client) CreateInstance(ctx context.Context, body CreateInstanceRequest) (*Instance, error) {
+	var out struct {
+		Instance Instance `json:"instance"`
+	}
+	if err := c.doBody(ctx, http.MethodPost, "/instances", body, &out); err != nil {
+		return nil, err
+	}
+	return &out.Instance, nil
+}
+
+// IsCreateOutcomeUnknown reports whether a CreateInstance error leaves it
+// unknown whether the instance was created. A cancelled request may already
+// have reached the API, so it counts.
+func IsCreateOutcomeUnknown(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return true
+	}
+	// The spec lists 500, 503 and 504; a proxy in front can also answer 502.
+	return apiErr.StatusCode >= http.StatusInternalServerError
+}
+
 // ListRegions returns the region codes the API accepts as filters.
 func (c *Client) ListRegions(ctx context.Context) ([]Region, error) {
 	var regions []Region
@@ -193,10 +230,26 @@ func (c *Client) StopInstance(ctx context.Context, id string) error {
 }
 
 func (c *Client) do(ctx context.Context, method, path string, out any) error {
+	return c.doBody(ctx, method, path, nil, out)
+}
+
+// doBody sends in as JSON when it is not nil. Only 429 is retried: the API
+// rejects those before doing anything.
+func (c *Client) doBody(ctx context.Context, method, path string, in, out any) error {
+	var payload []byte
+	if in != nil {
+		var err error
+		if payload, err = json.Marshal(in); err != nil {
+			return err
+		}
+	}
 	for attempt := 0; ; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, method, c.endpoint+path, nil)
+		req, err := http.NewRequestWithContext(ctx, method, c.endpoint+path, bytes.NewReader(payload))
 		if err != nil {
 			return err
+		}
+		if payload != nil {
+			req.Header.Set("Content-Type", "application/json")
 		}
 		req.Header.Set("Authorization", "Bearer "+c.token)
 		req.Header.Set("Accept", "application/json")

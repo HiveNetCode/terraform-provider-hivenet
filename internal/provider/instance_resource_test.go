@@ -1,9 +1,13 @@
 package provider
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -11,6 +15,8 @@ import (
 	"time"
 
 	"github.com/HiveNetCode/terraform-provider-hivenet/internal/acctest"
+	"github.com/HiveNetCode/terraform-provider-hivenet/internal/client"
+	sdkacctest "github.com/hashicorp/terraform-plugin-testing/helper/acctest"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
@@ -24,6 +30,7 @@ var fakeStatusNumbers = map[string]int{
 }
 
 type fakeInstance struct {
+	name   string
 	status string
 	// next holds the statuses later GETs step through, one per GET.
 	next []string
@@ -36,13 +43,19 @@ type fakeInstanceAPI struct {
 	mu        sync.Mutex
 	instances map[string]*fakeInstance
 	actions   []string
+	created   int
+	// createFails makes the next create answer with this status. With
+	// createStillHappens, the instance is created anyway, as after a 500
+	// whose outcome is unknown.
+	createFails        int
+	createStillHappens bool
 }
 
 func newFakeInstanceAPI(t *testing.T, statuses map[string]string) (*fakeInstanceAPI, string) {
 	t.Helper()
 	f := &fakeInstanceAPI{instances: map[string]*fakeInstance{}}
 	for id, s := range statuses {
-		f.instances[id] = &fakeInstance{status: s}
+		f.instances[id] = &fakeInstance{name: "web", status: s}
 	}
 	srv := httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(srv.Close)
@@ -54,6 +67,10 @@ func (f *fakeInstanceAPI) serve(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	if r.Header.Get("Authorization") != "Bearer test-token" {
 		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	if r.URL.Path == "/v1/instances" {
+		f.serveCollection(w, r)
 		return
 	}
 	rest, ok := strings.CutPrefix(r.URL.Path, "/v1/instances/")
@@ -93,15 +110,60 @@ func (f *fakeInstanceAPI) serve(w http.ResponseWriter, r *http.Request) {
 	f.writeInstance(w, id, inst)
 }
 
-func (f *fakeInstanceAPI) writeInstance(w http.ResponseWriter, id string, inst *fakeInstance) {
+// serveCollection lists instances, or creates one in CREATED that starts on
+// the next GETs.
+func (f *fakeInstanceAPI) serveCollection(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		search := r.URL.Query().Get("free_text_search")
+		var items []string
+		for id, inst := range f.instances {
+			if strings.Contains(inst.name, search) {
+				var b strings.Builder
+				f.writeInstance(&b, id, inst)
+				items = append(items, b.String())
+			}
+		}
+		_, _ = fmt.Fprintf(w, `{"data":[%s],"pagination":{"next":null}}`, strings.Join(items, ","))
+		return
+	}
+
+	var body struct {
+		Name    string `json:"name"`
+		ImageID string `json:"image_id"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	f.actions = append(f.actions, "create "+body.Name+" "+body.ImageID)
+	status := f.createFails
+	f.createFails = 0
+	if status != 0 && !f.createStillHappens {
+		w.WriteHeader(status)
+		_, _ = fmt.Fprintf(w, `{"error":{"code":"ERR","message":"create failed","request_id":"r"}}`)
+		return
+	}
+	f.created++
+	id := fmt.Sprintf("aaaaaaaa-0000-0000-0000-%012d", f.created)
+	inst := &fakeInstance{name: body.Name, status: "CREATED", next: []string{"STARTING", "RUNNING"}}
+	f.instances[id] = inst
+	if status != 0 {
+		w.WriteHeader(status)
+		_, _ = fmt.Fprintf(w, `{"error":{"code":"ERR","message":"create outcome unknown","request_id":"r"}}`)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+	_, _ = w.Write([]byte(`{"instance":`))
+	f.writeInstance(w, id, inst)
+	_, _ = w.Write([]byte(`}`))
+}
+
+func (f *fakeInstanceAPI) writeInstance(w io.Writer, id string, inst *fakeInstance) {
 	reason := ""
 	if inst.status == "ERRORED" {
 		reason = "image pull failed"
 	}
-	_, _ = fmt.Fprintf(w, `{"instance_id":%q,"name":"web","status":%d,"region":"france-2","gpu_type":"RTX 4090",
+	_, _ = fmt.Fprintf(w, `{"instance_id":%q,"name":%q,"status":%d,"region":"france-2","gpu_type":"RTX 4090",
 		"size":"1 x GPU","cpu_count":8,"resources":"1 x RTX 4090","bandwidth":1000,"storage_used_gb":100,
 		"hourly_rate":0.5,"started_at":{"seconds":"1793908800","nanos":0},"termination_reason":1,
-		"guest_ready":1,"guest_ready_reason":%q}`, id, fakeStatusNumbers[inst.status], reason)
+		"guest_ready":1,"guest_ready_reason":%q}`, id, inst.name, fakeStatusNumbers[inst.status], reason)
 }
 
 // set changes an instance behind Terraform's back, as Hive would.
@@ -116,6 +178,14 @@ func (f *fakeInstanceAPI) failStarts(id string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.instances[id].startTo = []string{"STARTING", "ERRORED"}
+}
+
+// failNextCreate makes the next create answer status; with stillCreates the
+// instance is created anyway.
+func (f *fakeInstanceAPI) failNextCreate(status int, stillCreates bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createFails, f.createStillHappens = status, stillCreates
 }
 
 func (f *fakeInstanceAPI) status(id string) string {
@@ -139,13 +209,13 @@ func fastPolling(t *testing.T) {
 
 const fakeID = "11111111-1111-1111-1111-111111111111"
 
-func importBlock(id string) string {
+func importBlock() string {
 	return fmt.Sprintf(`
 import {
   to = hivenet_instance.web
   id = %q
 }
-`, id)
+`, fakeID)
 }
 
 func instanceConfig(powerState string) string {
@@ -170,7 +240,7 @@ func TestInstanceResource_importAndPowerState(t *testing.T) {
 		},
 		Steps: []resource.TestStep{
 			{
-				Config: fakeProviderConfig(endpoint) + importBlock(fakeID) + instanceConfig("stopped"),
+				Config: fakeProviderConfig(endpoint) + importBlock() + instanceConfig("stopped"),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("hivenet_instance.web", "id", fakeID),
 					resource.TestCheckResourceAttr("hivenet_instance.web", "power_state", "stopped"),
@@ -212,7 +282,7 @@ func TestInstanceResource_drift(t *testing.T) {
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
-				Config: fakeProviderConfig(endpoint) + importBlock(fakeID) + instanceConfig("running"),
+				Config: fakeProviderConfig(endpoint) + importBlock() + instanceConfig("running"),
 			},
 			{
 				// Hive stops it, e.g. when credits run out: the plan starts it again.
@@ -227,10 +297,10 @@ func TestInstanceResource_drift(t *testing.T) {
 			},
 			{
 				// Hive terminates it: refresh drops it from state and the plan
-				// wants a create, which fails until the API can create.
+				// wants a create, which needs the create arguments.
 				PreConfig:   func() { f.set(fakeID, "TERMINATED") },
 				Config:      cfg,
-				ExpectError: regexp.MustCompile(`Creating instances is not supported yet`),
+				ExpectError: regexp.MustCompile(`"name" is required to create an instance`),
 			},
 		},
 	})
@@ -289,7 +359,7 @@ func TestInstanceResource_startTimeout(t *testing.T) {
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
-				Config: fakeProviderConfig(endpoint) + importBlock(fakeID) + instanceConfig("stopped"),
+				Config: fakeProviderConfig(endpoint) + importBlock() + instanceConfig("stopped"),
 			},
 			{
 				// The start never settles: the instance stays ERRORED.
@@ -309,7 +379,7 @@ resource "hivenet_instance" "web" {
 	})
 }
 
-func TestInstanceResource_createNotSupported(t *testing.T) {
+func TestInstanceResource_createNeedsArguments(t *testing.T) {
 	_, endpoint := newFakeInstanceAPI(t, nil)
 
 	resource.UnitTest(t, resource.TestCase{
@@ -317,16 +387,317 @@ func TestInstanceResource_createNotSupported(t *testing.T) {
 		Steps: []resource.TestStep{
 			{
 				Config:      fakeProviderConfig(endpoint) + instanceConfig("running"),
-				ExpectError: regexp.MustCompile(`Creating instances is not supported yet`),
+				ExpectError: regexp.MustCompile(`"preset_id" is required to create an instance`),
 			},
 		},
 	})
 }
 
+const fakePresetID = "99999999-9999-9999-9999-999999999999"
+
+func createConfig(name, imageID, powerState string) string {
+	return fmt.Sprintf(`
+resource "hivenet_instance" "web" {
+  name        = %q
+  preset_id   = %q
+  image_type  = "vm"
+  image_id    = %q
+  power_state = %q
+}
+`, name, fakePresetID, imageID, powerState)
+}
+
+func TestInstanceResource_createAndReplace(t *testing.T) {
+	fastPolling(t)
+	f, endpoint := newFakeInstanceAPI(t, nil)
+	first, second := "aaaaaaaa-0000-0000-0000-000000000001", "aaaaaaaa-0000-0000-0000-000000000002"
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy: func(*terraform.State) error {
+			if s := f.status(second); s != "TERMINATED" {
+				return fmt.Errorf("after destroy the instance is %s, want TERMINATED", s)
+			}
+			return nil
+		},
+		Steps: []resource.TestStep{
+			{
+				Config: fakeProviderConfig(endpoint) + createConfig("web-1", "ubuntu24.04", "running"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("hivenet_instance.web", "id", first),
+					resource.TestCheckResourceAttr("hivenet_instance.web", "name", "web-1"),
+					resource.TestCheckResourceAttr("hivenet_instance.web", "status", "RUNNING"),
+					resource.TestCheckResourceAttr("hivenet_instance.web", "power_state", "running"),
+					resource.TestCheckResourceAttr("hivenet_instance.web", "preset_id", fakePresetID),
+					resource.TestCheckResourceAttr("hivenet_instance.web", "image_id", "ubuntu24.04"),
+				),
+			},
+			{
+				// No update endpoint: a new image is a new instance.
+				Config: fakeProviderConfig(endpoint) + createConfig("web-1", "debian12", "running"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("hivenet_instance.web", plancheck.ResourceActionDestroyBeforeCreate),
+					},
+				},
+				Check: resource.TestCheckResourceAttr("hivenet_instance.web", "id", second),
+			},
+			{
+				ResourceName:            "hivenet_instance.web",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"timeouts", "preset_id", "image_type", "image_id"},
+			},
+		},
+	})
+
+	want := []string{"create web-1 ubuntu24.04", "terminate " + first, "create web-1 debian12", "terminate " + second}
+	if got := f.actionLog(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("API actions = %v, want %v", got, want)
+	}
+}
+
+func TestInstanceResource_createStopped(t *testing.T) {
+	fastPolling(t)
+	f, endpoint := newFakeInstanceAPI(t, nil)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: fakeProviderConfig(endpoint) + createConfig("web-1", "ubuntu24.04", "stopped"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("hivenet_instance.web", "power_state", "stopped"),
+					resource.TestCheckResourceAttr("hivenet_instance.web", "status", "STOPPED"),
+				),
+			},
+		},
+	})
+
+	id := "aaaaaaaa-0000-0000-0000-000000000001"
+	want := []string{"create web-1 ubuntu24.04", "stop " + id, "terminate " + id}
+	if got := f.actionLog(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("API actions = %v, want %v", got, want)
+	}
+}
+
+func TestInstanceResource_createOutcomeUnknown(t *testing.T) {
+	fastPolling(t)
+	for name, tc := range map[string]struct {
+		stillCreates bool
+		wantErr      string
+	}{
+		// Names are not unique, so a new instance with the name may be another
+		// resource's: report it, never adopt it.
+		"created anyway is reported": {stillCreates: true, wantErr: `(?s)may have been created.*aaaaaaaa-0000-0000-0000-000000000001.*import it`},
+		"nothing seen yet":           {wantErr: `(?s)may have been created.*none named "web-1" has appeared yet`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			// An instance with the same name that already existed is never reported.
+			f, endpoint := newFakeInstanceAPI(t, map[string]string{fakeID: "RUNNING"})
+			f.instances[fakeID].name = "web-1"
+			f.failNextCreate(http.StatusInternalServerError, tc.stillCreates)
+
+			resource.UnitTest(t, resource.TestCase{
+				ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+				Steps: []resource.TestStep{{
+					Config:      fakeProviderConfig(endpoint) + createConfig("web-1", "ubuntu24.04", "running"),
+					ExpectError: regexp.MustCompile(tc.wantErr),
+				}},
+			})
+
+			creates := 0
+			for _, a := range f.actionLog() {
+				if strings.HasPrefix(a, "create ") {
+					creates++
+				}
+			}
+			if creates != 1 {
+				t.Errorf("%d creates, want 1: a create with an unknown outcome must not be retried", creates)
+			}
+			if strings.Contains(strings.Join(f.actionLog(), ","), fakeID) {
+				t.Errorf("API actions %v touch the pre-existing instance", f.actionLog())
+			}
+		})
+	}
+}
+
+// TestInstanceResource_removedArgumentKept checks that dropping a create
+// argument from config and adding a different one later still replaces.
+func TestInstanceResource_removedArgumentKept(t *testing.T) {
+	fastPolling(t)
+	_, endpoint := newFakeInstanceAPI(t, nil)
+	withoutImage := fakeProviderConfig(endpoint) + fmt.Sprintf(`
+resource "hivenet_instance" "web" {
+  name        = "web-1"
+  preset_id   = %q
+  image_type  = "vm"
+  power_state = "running"
+}
+`, fakePresetID)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: fakeProviderConfig(endpoint) + createConfig("web-1", "ubuntu24.04", "running"),
+			},
+			{
+				Config:   withoutImage,
+				PlanOnly: true,
+			},
+			{
+				Config: withoutImage,
+				Check:  resource.TestCheckResourceAttr("hivenet_instance.web", "image_id", "ubuntu24.04"),
+			},
+			{
+				Config: fakeProviderConfig(endpoint) + createConfig("web-1", "debian12", "running"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("hivenet_instance.web", plancheck.ResourceActionDestroyBeforeCreate),
+					},
+				},
+			},
+		},
+	})
+}
+
+func TestInstanceResource_createSoldOut(t *testing.T) {
+	f, endpoint := newFakeInstanceAPI(t, nil)
+	f.failNextCreate(http.StatusConflict, false)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config:      fakeProviderConfig(endpoint) + createConfig("web-1", "ubuntu24.04", "running"),
+				ExpectError: regexp.MustCompile(`(?s)Nothing was created.*sold out`),
+			},
+		},
+	})
+}
+
+func TestInstanceResource_importedThenCreateArguments(t *testing.T) {
+	fastPolling(t)
+	_, endpoint := newFakeInstanceAPI(t, map[string]string{fakeID: "RUNNING"})
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: fakeProviderConfig(endpoint) + importBlock() + instanceConfig("running"),
+			},
+			{
+				// The API cannot tell the import what these were, so setting
+				// them must not replace the instance.
+				Config: fakeProviderConfig(endpoint) + createConfig("web", "ubuntu24.04", "running"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("hivenet_instance.web", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.TestCheckResourceAttr("hivenet_instance.web", "id", fakeID),
+			},
+			{
+				Config:             fakeProviderConfig(endpoint) + createConfig("web-renamed", "ubuntu24.04", "running"),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PostApplyPostRefresh: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("hivenet_instance.web", plancheck.ResourceActionDestroyBeforeCreate),
+					},
+				},
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_create creates a CPU instance, stops it, checks that
+// a rename plans a replace, and destroys it. The test org needs a registered
+// SSH key: without one the API refuses every create.
+func TestAccInstanceResource_create(t *testing.T) {
+	if os.Getenv(resource.EnvTfAcc) == "" {
+		t.Skipf("acceptance test: set %s=1 to run", resource.EnvTfAcc)
+	}
+	preset := acctest.CPUPreset(t)
+	imageType, imageID := acctest.Image()
+	name := sdkacctest.RandomWithPrefix(acctest.NamePrefix + "create")
+	cfg := func(name, powerState string) string {
+		return fmt.Sprintf(`
+resource "hivenet_instance" "test" {
+  name        = %q
+  preset_id   = %q
+  image_type  = %q
+  image_id    = %q
+  power_state = %q
+}
+`, name, preset, imageType, imageID, powerState)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckInstancesTerminated,
+		Steps: []resource.TestStep{
+			{
+				Config: cfg(name, "running"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet("hivenet_instance.test", "id"),
+					resource.TestCheckResourceAttr("hivenet_instance.test", "name", name),
+					resource.TestCheckResourceAttr("hivenet_instance.test", "status", "RUNNING"),
+				),
+			},
+			{
+				Config: cfg(name, "stopped"),
+				Check:  resource.TestCheckResourceAttr("hivenet_instance.test", "status", "STOPPED"),
+			},
+			{
+				ResourceName:            "hivenet_instance.test",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"timeouts", "guest_ready", "preset_id", "image_type", "image_id"},
+			},
+			{
+				Config:             cfg(name+"-renamed", "stopped"),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PostApplyPostRefresh: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("hivenet_instance.test", plancheck.ResourceActionDestroyBeforeCreate),
+					},
+				},
+			},
+		},
+	})
+}
+
+// testAccCheckInstancesTerminated checks every hivenet_instance in s is gone.
+func testAccCheckInstancesTerminated(s *terraform.State) error {
+	c, err := acctest.Client()
+	if err != nil {
+		return err
+	}
+	for _, rs := range s.RootModule().Resources {
+		if rs.Type != "hivenet_instance" {
+			continue
+		}
+		inst, err := c.GetInstance(context.Background(), rs.Primary.ID)
+		if client.IsStatus(err, http.StatusNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if inst.Status != "TERMINATED" {
+			return fmt.Errorf("instance %s is %s after destroy, want TERMINATED", inst.ID, inst.Status)
+		}
+	}
+	return nil
+}
+
 // TestAccInstanceResource_fixture imports the test org's fixture instance,
 // starts and stops it, and leaves it stopped. It never destroys it: the last
-// step drops it from state with a removed block. Destroy is covered by the
-// unit tests until the API can create instances.
+// step drops it from state with a removed block.
 func TestAccInstanceResource_fixture(t *testing.T) {
 	id := acctest.FixtureInstanceID(t)
 	// prevent_destroy stops the post-test destroy from terminating the
