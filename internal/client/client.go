@@ -139,7 +139,7 @@ func (c *Client) GetInstance(ctx context.Context, id string) (*Instance, error) 
 }
 
 // CreateInstance creates and starts an instance. Creates are not idempotent:
-// it never retries, and a 500, 503, 504 or transport error leaves the outcome
+// it never retries, and a 5xx or transport error leaves the outcome
 // unknown, which IsCreateOutcomeUnknown reports.
 func (c *Client) CreateInstance(ctx context.Context, body CreateInstanceRequest) (*Instance, error) {
 	var out struct {
@@ -162,11 +162,8 @@ func IsCreateOutcomeUnknown(err error) bool {
 	if !errors.As(err, &apiErr) {
 		return true
 	}
-	switch apiErr.StatusCode {
-	case http.StatusInternalServerError, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		return true
-	}
-	return false
+	// The spec lists 500, 503 and 504; a proxy in front can also answer 502.
+	return apiErr.StatusCode >= http.StatusInternalServerError
 }
 
 // ListRegions returns the region codes the API accepts as filters.

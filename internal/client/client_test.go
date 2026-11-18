@@ -202,6 +202,7 @@ func TestIsCreateOutcomeUnknown(t *testing.T) {
 	}{
 		{nil, false},
 		{&APIError{StatusCode: http.StatusInternalServerError}, true},
+		{&APIError{StatusCode: http.StatusBadGateway}, true},
 		{&APIError{StatusCode: http.StatusGatewayTimeout}, true},
 		{&APIError{StatusCode: http.StatusConflict}, false},
 		{&APIError{StatusCode: http.StatusNotFound}, false},
