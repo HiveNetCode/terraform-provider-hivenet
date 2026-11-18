@@ -485,26 +485,25 @@ func TestInstanceResource_createOutcomeUnknown(t *testing.T) {
 	fastPolling(t)
 	for name, tc := range map[string]struct {
 		stillCreates bool
-		wantErr      *regexp.Regexp
+		wantErr      string
 	}{
-		"created anyway is adopted": {stillCreates: true},
-		"nothing created":           {wantErr: regexp.MustCompile(`No instance was created; it is safe to apply again`)},
+		// Names are not unique, so a new instance with the name may be another
+		// resource's: report it, never adopt it.
+		"created anyway is reported": {stillCreates: true, wantErr: `(?s)may have been created.*aaaaaaaa-0000-0000-0000-000000000001.*import it`},
+		"nothing seen yet":           {wantErr: `(?s)may have been created.*none named "web-1" has appeared yet`},
 	} {
 		t.Run(name, func(t *testing.T) {
-			// An instance with the same name that already existed is never adopted.
+			// An instance with the same name that already existed is never reported.
 			f, endpoint := newFakeInstanceAPI(t, map[string]string{fakeID: "RUNNING"})
 			f.instances[fakeID].name = "web-1"
 			f.failNextCreate(http.StatusInternalServerError, tc.stillCreates)
 
-			step := resource.TestStep{Config: fakeProviderConfig(endpoint) + createConfig("web-1", "ubuntu24.04", "running")}
-			if tc.wantErr != nil {
-				step.ExpectError = tc.wantErr
-			} else {
-				step.Check = resource.TestCheckResourceAttr("hivenet_instance.web", "id", "aaaaaaaa-0000-0000-0000-000000000001")
-			}
 			resource.UnitTest(t, resource.TestCase{
 				ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
-				Steps:                    []resource.TestStep{step},
+				Steps: []resource.TestStep{{
+					Config:      fakeProviderConfig(endpoint) + createConfig("web-1", "ubuntu24.04", "running"),
+					ExpectError: regexp.MustCompile(tc.wantErr),
+				}},
 			})
 
 			creates := 0
@@ -516,8 +515,51 @@ func TestInstanceResource_createOutcomeUnknown(t *testing.T) {
 			if creates != 1 {
 				t.Errorf("%d creates, want 1: a create with an unknown outcome must not be retried", creates)
 			}
+			if strings.Contains(strings.Join(f.actionLog(), ","), fakeID) {
+				t.Errorf("API actions %v touch the pre-existing instance", f.actionLog())
+			}
 		})
 	}
+}
+
+// TestInstanceResource_removedArgumentKept checks that dropping a create
+// argument from config and adding a different one later still replaces.
+func TestInstanceResource_removedArgumentKept(t *testing.T) {
+	fastPolling(t)
+	_, endpoint := newFakeInstanceAPI(t, nil)
+	withoutImage := fakeProviderConfig(endpoint) + fmt.Sprintf(`
+resource "hivenet_instance" "web" {
+  name        = "web-1"
+  preset_id   = %q
+  image_type  = "vm"
+  power_state = "running"
+}
+`, fakePresetID)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: fakeProviderConfig(endpoint) + createConfig("web-1", "ubuntu24.04", "running"),
+			},
+			{
+				Config:   withoutImage,
+				PlanOnly: true,
+			},
+			{
+				Config: withoutImage,
+				Check:  resource.TestCheckResourceAttr("hivenet_instance.web", "image_id", "ubuntu24.04"),
+			},
+			{
+				Config: fakeProviderConfig(endpoint) + createConfig("web-1", "debian12", "running"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("hivenet_instance.web", plancheck.ResourceActionDestroyBeforeCreate),
+					},
+				},
+			},
+		},
+	})
 }
 
 func TestInstanceResource_createSoldOut(t *testing.T) {

@@ -45,11 +45,11 @@ resource "hivenet_instance" "web" {
 
 ### Optional
 
-- `image_id` (String) ID of the image, e.g. `ubuntu24.04`. It must suit the preset: a GPU preset needs a GPU image. Windows images cannot be created through the API yet. Required to create. Not returned by the API, so it is empty after an import, and setting it then does not replace the instance. Changing it later replaces the instance.
-- `image_type` (String) `vm` or `container`. Required to create. Not returned by the API, so it is empty after an import, and setting it then does not replace the instance. Changing it later replaces the instance.
+- `image_id` (String) ID of the image, e.g. `ubuntu24.04`. It must suit the preset: a GPU preset needs a GPU image. Windows images cannot be created through the API yet. Required to create. Not returned by the API, so it is empty after an import, and setting it then does not replace the instance. Changing it later replaces the instance; removing it from the configuration keeps the value.
+- `image_type` (String) `vm` or `container`. Required to create. Not returned by the API, so it is empty after an import, and setting it then does not replace the instance. Changing it later replaces the instance; removing it from the configuration keeps the value.
 - `name` (String) Display name: letters, digits, hyphens and underscores. Required to create. Names are not unique. Changing it replaces the instance.
 - `power_state` (String) `running` or `stopped`. Changing it starts or stops the instance and waits for it to settle. Leave it unset to only track the instance. An instance Hive stopped on its own, for example when credits ran out, shows up as a change back to `running`.
-- `preset_id` (String) ID of the preset to create the instance from, from the `hivenet_presets` data source. It sets the location, hardware and price. Required to create. Not returned by the API, so it is empty after an import, and setting it then does not replace the instance. Changing it later replaces the instance.
+- `preset_id` (String) ID of the preset to create the instance from, from the `hivenet_presets` data source. It sets the location, hardware and price. Required to create. Not returned by the API, so it is empty after an import, and setting it then does not replace the instance. Changing it later replaces the instance; removing it from the configuration keeps the value.
 - `timeouts` (Block, Optional) (see [below for nested schema](#nestedblock--timeouts))
 
 ### Read-Only

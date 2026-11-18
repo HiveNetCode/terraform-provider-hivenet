@@ -152,9 +152,10 @@ func (c *Client) CreateInstance(ctx context.Context, body CreateInstanceRequest)
 }
 
 // IsCreateOutcomeUnknown reports whether a CreateInstance error leaves it
-// unknown whether the instance was created.
+// unknown whether the instance was created. A cancelled request may already
+// have reached the API, so it counts.
 func IsCreateOutcomeUnknown(err error) bool {
-	if err == nil || errors.Is(err, context.Canceled) {
+	if err == nil {
 		return false
 	}
 	var apiErr *APIError

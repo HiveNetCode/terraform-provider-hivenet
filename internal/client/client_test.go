@@ -206,7 +206,7 @@ func TestIsCreateOutcomeUnknown(t *testing.T) {
 		{&APIError{StatusCode: http.StatusConflict}, false},
 		{&APIError{StatusCode: http.StatusNotFound}, false},
 		{errors.New("connection reset"), true},
-		{context.Canceled, false},
+		{context.Canceled, true},
 	} {
 		if got := IsCreateOutcomeUnknown(tc.err); got != tc.want {
 			t.Errorf("IsCreateOutcomeUnknown(%v) = %v, want %v", tc.err, got, tc.want)

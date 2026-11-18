@@ -138,8 +138,9 @@ func (r *instanceResource) Schema(ctx context.Context, req resource.SchemaReques
 			"image_type": schema.StringAttribute{
 				MarkdownDescription: "`vm` or `container`. Required to create. " + createOnlyNote,
 				Optional:            true,
+				Computed:            true,
 				Validators:          []validator.String{stringvalidator.OneOf("vm", "container")},
-				PlanModifiers:       []planmodifier.String{replaceOnChange()},
+				PlanModifiers:       []planmodifier.String{stringplanmodifier.UseStateForUnknown(), replaceOnChange()},
 			},
 			"image_id": createOnly("ID of the image, e.g. `ubuntu24.04`. It must suit the preset: a GPU preset needs a GPU image. " +
 				"Windows images cannot be created through the API yet. Required to create."),
@@ -261,8 +262,8 @@ func (r *instanceResource) Create(ctx context.Context, req resource.CreateReques
 }
 
 // createInstance creates the instance. When the API cannot say whether it did,
-// it looks for an instance with the same name that was not there before, so a
-// retry never leaves a second billed instance behind.
+// it never adopts or retries: names are not unique, so it lists the new
+// instances with the same name for the user to check.
 func (r *instanceResource) createInstance(ctx context.Context, body client.CreateInstanceRequest) (*client.Instance, error) {
 	existing, err := r.client.ListInstances(ctx, client.ListInstancesOptions{FreeTextSearch: body.Name})
 	if err != nil {
@@ -287,29 +288,26 @@ func (r *instanceResource) createInstance(ctx context.Context, body client.Creat
 		return nil, err
 	}
 
-	after, listErr := r.client.ListInstances(ctx, client.ListInstancesOptions{FreeTextSearch: body.Name})
+	// Check even if the apply was cancelled: the create may still have happened.
+	checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	after, listErr := r.client.ListInstances(checkCtx, client.ListInstancesOptions{FreeTextSearch: body.Name})
 	if listErr != nil {
 		return nil, fmt.Errorf("%w\n\nThe instance may have been created, and checking failed: %v. "+
-			"Look for an instance named %q before applying again", err, listErr, body.Name)
+			"Look for an instance named %q before applying again, or the next apply may create a second one", err, listErr, body.Name)
 	}
-	var created []client.Instance
+	var ids []string
 	for _, inst := range after {
 		if inst.Name == body.Name && !before[inst.ID] && inst.Status != statusTerminating && inst.Status != statusTerminated {
-			created = append(created, inst)
+			ids = append(ids, inst.ID)
 		}
 	}
-	switch len(created) {
-	case 0:
-		return nil, fmt.Errorf("%w\n\nNo instance was created; it is safe to apply again", err)
-	case 1:
-		return &created[0], nil
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("%w\n\nThe instance may have been created: none named %q has appeared yet, but the create "+
+			"can still complete. Check your instances before applying again, or the next apply may create a second one", err, body.Name)
 	}
-	ids := make([]string, len(created))
-	for i, inst := range created {
-		ids[i] = inst.ID
-	}
-	return nil, fmt.Errorf("%w\n\nThe outcome is unknown and several new instances are named %q: %s. "+
-		"Import the right one, or terminate the extras", err, body.Name, strings.Join(ids, ", "))
+	return nil, fmt.Errorf("%w\n\nThe instance may have been created. New instances named %q: %s. "+
+		"If one is this resource's, import it instead of applying again; terminate any you do not want", err, body.Name, strings.Join(ids, ", "))
 }
 
 func (r *instanceResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
@@ -388,6 +386,12 @@ func (r *instanceResource) Update(ctx context.Context, req resource.UpdateReques
 	// rejects the apply; the next refresh picks up any drift in them.
 	d := instanceToModel(inst)
 	plan.Status, plan.StartedAt, plan.GuestReady = d.Status, d.StartedAt, d.GuestReady
+	// An imported instance has no create arguments to keep.
+	for _, v := range []*types.String{&plan.PresetID, &plan.ImageType, &plan.ImageID} {
+		if v.IsUnknown() {
+			*v = types.StringNull()
+		}
+	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -487,22 +491,23 @@ func waitForStatus(ctx context.Context, c *client.Client, id string, target clie
 }
 
 const createOnlyNote = "Not returned by the API, so it is empty after an import, and setting it then does not replace the instance. " +
-	"Changing it later replaces the instance."
+	"Changing it later replaces the instance; removing it from the configuration keeps the value."
 
 func createOnly(desc string) schema.StringAttribute {
 	return schema.StringAttribute{
 		MarkdownDescription: desc + " " + createOnlyNote,
 		Optional:            true,
-		PlanModifiers:       []planmodifier.String{replaceOnChange()},
+		Computed:            true,
+		PlanModifiers:       []planmodifier.String{stringplanmodifier.UseStateForUnknown(), replaceOnChange()},
 	}
 }
 
-// replaceOnChange replaces the instance when a create argument changes, but
-// not when it is first set on an imported instance or removed from config.
+// replaceOnChange replaces the instance when a known create argument changes,
+// but not when it is first set on an imported instance.
 func replaceOnChange() planmodifier.String {
 	return stringplanmodifier.RequiresReplaceIf(
 		func(ctx context.Context, req planmodifier.StringRequest, resp *stringplanmodifier.RequiresReplaceIfFuncResponse) {
-			resp.RequiresReplace = !req.StateValue.IsNull() && !req.PlanValue.IsNull()
+			resp.RequiresReplace = !req.StateValue.IsNull()
 		},
 		"Changing it replaces the instance.",
 		"Changing it replaces the instance.",
