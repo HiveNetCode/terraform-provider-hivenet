@@ -2,6 +2,7 @@ package provider
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -212,18 +213,36 @@ data "hivenet_images" "mine" {
 
 func TestImagesDataSource_invalidConfig(t *testing.T) {
 	endpoint, agents := fakeAPI(t)
+	// terraform_data.t.output stays unknown until apply.
+	const applyTime = `resource "terraform_data" "t" {
+  input = %q
+}
+`
 
-	for name, tc := range map[string]struct{ config, wantErr string }{
-		"mine on vm":                 {`type = "vm"` + "\n" + `mine = true`, `needs type = "container"`},
-		"gpu_supported on container": {`type = "container"` + "\n" + `gpu_supported = true`, `needs type = "vm"`},
-		"bad regex":                  {`type = "vm"` + "\n" + `name_regex = "("`, `Invalid name_regex`},
-		"bad type":                   {`type = "windows"`, `value must be one of`},
+	for name, tc := range map[string]struct {
+		config, wantErr string
+		planOnly        bool
+	}{
+		"mine on vm":                 {config: imagesConfig(`type = "vm"`, `mine = true`), wantErr: `needs type = "container"`},
+		"gpu_supported on container": {config: imagesConfig(`type = "container"`, `gpu_supported = true`), wantErr: `needs type = "vm"`},
+		"bad regex":                  {config: imagesConfig(`type = "vm"`, `name_regex = "("`), wantErr: `Invalid name_regex`},
+		"bad type":                   {config: imagesConfig(`type = "windows"`), wantErr: `value must be one of`},
+		"bad regex, type known at apply": {
+			config:   fmt.Sprintf(applyTime, "vm") + imagesConfig(`type = terraform_data.t.output`, `name_regex = "("`),
+			wantErr:  `Invalid name_regex`,
+			planOnly: true,
+		},
+		"gpu_supported on container, type known at apply": {
+			config:  fmt.Sprintf(applyTime, "container") + imagesConfig(`type = terraform_data.t.output`, `gpu_supported = true`),
+			wantErr: `needs type = "vm"`,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			resource.UnitTest(t, resource.TestCase{
 				ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 				Steps: []resource.TestStep{{
-					Config:      fakeProviderConfig(endpoint) + "data \"hivenet_images\" \"x\" {\n" + tc.config + "\n}\n",
+					Config:      fakeProviderConfig(endpoint) + tc.config,
+					PlanOnly:    tc.planOnly,
 					ExpectError: regexp.MustCompile(tc.wantErr),
 				}},
 			})
@@ -232,6 +251,27 @@ func TestImagesDataSource_invalidConfig(t *testing.T) {
 	if len(*agents) != 0 {
 		t.Errorf("%d API calls, want none: invalid config must fail before reading", len(*agents))
 	}
+}
+
+func TestImagesDataSource_nullVariableFilter(t *testing.T) {
+	endpoint, _ := fakeAPI(t)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{{
+			Config: fakeProviderConfig(endpoint) + `
+variable "gpu" {
+  type    = bool
+  default = null
+}
+` + imagesConfig(`type = "container"`, `gpu_supported = var.gpu`),
+			Check: resource.TestCheckResourceAttr("data.hivenet_images.x", "images.#", "1"),
+		}},
+	})
+}
+
+func imagesConfig(args ...string) string {
+	return "data \"hivenet_images\" \"x\" {\n  " + strings.Join(args, "\n  ") + "\n}\n"
 }
 
 func TestDataSources_fakeAPIErrors(t *testing.T) {

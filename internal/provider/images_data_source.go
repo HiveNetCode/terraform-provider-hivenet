@@ -6,8 +6,10 @@ import (
 
 	"github.com/HiveNetCode/terraform-provider-hivenet/internal/client"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -139,23 +141,36 @@ func (d *imagesDataSource) Schema(ctx context.Context, req datasource.SchemaRequ
 func (d *imagesDataSource) ValidateConfig(ctx context.Context, req datasource.ValidateConfigRequest, resp *datasource.ValidateConfigResponse) {
 	var cfg imagesModel
 	resp.Diagnostics.Append(req.Config.Get(ctx, &cfg)...)
-	if resp.Diagnostics.HasError() || cfg.Type.IsUnknown() || cfg.Type.IsNull() {
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	validateImagesConfig(cfg, &resp.Diagnostics)
+}
+
+// validateImagesConfig skips values that are still unknown; Terraform
+// validates again once they are known.
+func validateImagesConfig(cfg imagesModel, diags *diag.Diagnostics) {
+	if isKnown(cfg.NameRegex) {
+		if _, err := regexp.Compile(cfg.NameRegex.ValueString()); err != nil {
+			diags.AddAttributeError(path.Root("name_regex"), "Invalid name_regex", err.Error())
+		}
+	}
+	if !isKnown(cfg.Type) {
 		return
 	}
 	imageType := cfg.Type.ValueString()
-	if imageType != imageTypeContainer && cfg.Mine.ValueBool() {
-		resp.Diagnostics.AddAttributeError(path.Root("mine"), "Invalid mine",
+	if imageType != imageTypeContainer && isKnown(cfg.Mine) && cfg.Mine.ValueBool() {
+		diags.AddAttributeError(path.Root("mine"), "Invalid mine",
 			"`mine` lists saved container templates, so it needs type = \"container\".")
 	}
-	if imageType != imageTypeVM && !cfg.GPUSupported.IsNull() {
-		resp.Diagnostics.AddAttributeError(path.Root("gpu_supported"), "Invalid gpu_supported",
+	if imageType != imageTypeVM && isKnown(cfg.GPUSupported) {
+		diags.AddAttributeError(path.Root("gpu_supported"), "Invalid gpu_supported",
 			"`gpu_supported` filters VM images, so it needs type = \"vm\".")
 	}
-	if !cfg.NameRegex.IsNull() && !cfg.NameRegex.IsUnknown() {
-		if _, err := regexp.Compile(cfg.NameRegex.ValueString()); err != nil {
-			resp.Diagnostics.AddAttributeError(path.Root("name_regex"), "Invalid name_regex", err.Error())
-		}
-	}
+}
+
+func isKnown(v attr.Value) bool {
+	return !v.IsNull() && !v.IsUnknown()
 }
 
 func (d *imagesDataSource) Configure(ctx context.Context, req datasource.ConfigureRequest, resp *datasource.ConfigureResponse) {
