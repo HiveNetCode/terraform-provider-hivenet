@@ -101,6 +101,7 @@ func (p *HivenetProvider) DataSources(ctx context.Context) []func() datasource.D
 	return []func() datasource.DataSource{
 		NewRegionsDataSource,
 		NewPresetsDataSource,
+		NewImagesDataSource,
 		NewInstanceDataSource,
 	}
 }

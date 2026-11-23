@@ -148,6 +148,49 @@ func TestListPresetsFiltersAndFollowsCursor(t *testing.T) {
 	}
 }
 
+func TestListImagesVMSendsOnlyType(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.RawQuery; got != "type=vm" {
+			t.Errorf("query = %q, want type=vm: the API refuses size and cursor for VM images", got)
+		}
+		_, _ = w.Write([]byte(`{"data":[{"type":"vm","id":"ubuntu24.04","os_family":"LINUX","gpu_supported":true,"min_disk_gb":20}],
+			"pagination":{"next":null,"size":1}}`))
+	})
+
+	got, err := c.ListImages(t.Context(), ListImagesOptions{Type: "vm"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != "ubuntu24.04" || !got[0].GPUSupported || got[0].MinDiskGB != 20 {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestListImagesContainerMineFollowsCursor(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if q.Get("type") != "container" || q.Get("mine") != "true" {
+			t.Errorf("query = %v", q)
+		}
+		switch q.Get("cursor") {
+		case "":
+			_, _ = w.Write([]byte(`{"data":[{"type":"container","id":"c1","created_at":null}],"pagination":{"next":"c2","size":1}}`))
+		case "c2":
+			_, _ = w.Write([]byte(`{"data":[{"type":"container","id":"c2","created_at":"2026-11-01T10:00:00.000Z"}],"pagination":{"next":null,"size":1}}`))
+		default:
+			t.Errorf("unexpected cursor %q", q.Get("cursor"))
+		}
+	})
+
+	got, err := c.ListImages(t.Context(), ListImagesOptions{Type: "container", Mine: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].CreatedAt != nil || got[1].CreatedAt == nil {
+		t.Fatalf("got %+v", got)
+	}
+}
+
 func TestCreateInstance(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/instances" {

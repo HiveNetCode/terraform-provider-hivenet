@@ -2,6 +2,7 @@ package provider
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -42,6 +43,25 @@ func fakeAPI(t *testing.T) (endpoint string, userAgents *[]string) {
 				"memory":"192","storage":"500","hourly_price":"3.2000","price_discounted":""},
 				{"id":"p-live","region":"FR","location":"france-2","gpu":"1×","cpu":"8 vCPU","memory":"32 GB",
 				"storage":"100 GB","hourly_price":"€1.50/h","price_discounted":"€1.20/h"}],"pagination":{"next":null,"size":200}}`))
+		case r.URL.Path == "/v1/images" && r.URL.RawQuery == "type=vm":
+			_, _ = w.Write([]byte(`{"data":[
+				{"type":"vm","id":"ubuntu24.04","name":"Ubuntu 24.04 LTS","os_family":"LINUX","gpu_supported":true,
+					"login_user":"ubuntu","min_disk_gb":20,"min_memory_gb":2,"secure_boot":false,"tpm":false},
+				{"type":"vm","id":"debian12-cpu","name":"Debian 12","os_family":"LINUX","gpu_supported":false,
+					"login_user":"debian","min_disk_gb":10,"min_memory_gb":0,"secure_boot":false,"tpm":false},
+				{"type":"vm","id":"win2022","name":"Windows Server 2022","os_family":"WINDOWS","gpu_supported":true,
+					"login_user":"","min_disk_gb":64,"min_memory_gb":4,"secure_boot":true,"tpm":true}],
+				"pagination":{"next":null,"size":3}}`))
+		case r.URL.Path == "/v1/images" && r.URL.Query().Get("type") == "container":
+			mine := r.URL.Query().Get("mine") == "true"
+			id, name := "jupyter", "Jupyter"
+			if mine {
+				id, name = "my-template", "My template"
+			}
+			_, _ = w.Write([]byte(`{"data":[{"type":"container","id":"` + id + `","name":"` + name + `",
+				"software_list":["python","jupyter"],"registry":"docker.io","image":"jupyter/base-notebook:latest",
+				"workload_type":"GPU","env":[],"requires_init":false,"command":"","created_at":null}],
+				"pagination":{"next":null,"size":1}}`))
 		case r.URL.Path == "/v1/presets":
 			_, _ = w.Write([]byte(`{"data":[],"pagination":{"next":null,"size":200}}`))
 		case strings.HasPrefix(r.URL.Path, "/v1/instances/1111"):
@@ -134,6 +154,126 @@ data "hivenet_instance" "terminated" {
 	}
 }
 
+func TestImagesDataSource_fakeAPI(t *testing.T) {
+	endpoint, _ := fakeAPI(t)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: fakeProviderConfig(endpoint) + `
+data "hivenet_images" "vm" {
+  type = "vm"
+}
+
+data "hivenet_images" "ubuntu_gpu" {
+  type          = "vm"
+  name_regex    = "^(Ubuntu|Windows)"
+  gpu_supported = true
+}
+
+data "hivenet_images" "catalogue" {
+  type = "container"
+}
+
+data "hivenet_images" "mine" {
+  type = "container"
+  mine = true
+}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("data.hivenet_images.vm", "images.#", "3"),
+					resource.TestCheckResourceAttr("data.hivenet_images.vm", "images.0.id", "ubuntu24.04"),
+					resource.TestCheckResourceAttr("data.hivenet_images.vm", "images.0.type", "vm"),
+					resource.TestCheckResourceAttr("data.hivenet_images.vm", "images.0.os_family", "LINUX"),
+					resource.TestCheckResourceAttr("data.hivenet_images.vm", "images.0.login_user", "ubuntu"),
+					resource.TestCheckResourceAttr("data.hivenet_images.vm", "images.0.min_disk_gb", "20"),
+					resource.TestCheckResourceAttr("data.hivenet_images.vm", "images.2.secure_boot", "true"),
+					resource.TestCheckNoResourceAttr("data.hivenet_images.vm", "images.0.registry"),
+					resource.TestCheckNoResourceAttr("data.hivenet_images.vm", "images.0.software_list.#"),
+
+					resource.TestCheckResourceAttr("data.hivenet_images.ubuntu_gpu", "images.#", "2"),
+					resource.TestCheckResourceAttr("data.hivenet_images.ubuntu_gpu", "images.1.id", "win2022"),
+
+					resource.TestCheckResourceAttr("data.hivenet_images.catalogue", "images.#", "1"),
+					resource.TestCheckResourceAttr("data.hivenet_images.catalogue", "images.0.id", "jupyter"),
+					resource.TestCheckResourceAttr("data.hivenet_images.catalogue", "images.0.software_list.#", "2"),
+					resource.TestCheckResourceAttr("data.hivenet_images.catalogue", "images.0.workload_type", "GPU"),
+					resource.TestCheckResourceAttr("data.hivenet_images.catalogue", "images.0.command", ""),
+					resource.TestCheckNoResourceAttr("data.hivenet_images.catalogue", "images.0.created_at"),
+					resource.TestCheckNoResourceAttr("data.hivenet_images.catalogue", "images.0.os_family"),
+					resource.TestCheckNoResourceAttr("data.hivenet_images.catalogue", "images.0.gpu_supported"),
+
+					resource.TestCheckResourceAttr("data.hivenet_images.mine", "images.0.id", "my-template"),
+				),
+			},
+		},
+	})
+}
+
+func TestImagesDataSource_invalidConfig(t *testing.T) {
+	endpoint, agents := fakeAPI(t)
+	// terraform_data.t.output stays unknown until apply.
+	const applyTime = `resource "terraform_data" "t" {
+  input = %q
+}
+`
+
+	for name, tc := range map[string]struct {
+		config, wantErr string
+		planOnly        bool
+	}{
+		"mine on vm":                 {config: imagesConfig(`type = "vm"`, `mine = true`), wantErr: `needs type = "container"`},
+		"gpu_supported on container": {config: imagesConfig(`type = "container"`, `gpu_supported = true`), wantErr: `needs type = "vm"`},
+		"bad regex":                  {config: imagesConfig(`type = "vm"`, `name_regex = "("`), wantErr: `Invalid name_regex`},
+		"bad type":                   {config: imagesConfig(`type = "windows"`), wantErr: `value must be one of`},
+		"bad regex, type known at apply": {
+			config:   fmt.Sprintf(applyTime, "vm") + imagesConfig(`type = terraform_data.t.output`, `name_regex = "("`),
+			wantErr:  `Invalid name_regex`,
+			planOnly: true,
+		},
+		"gpu_supported on container, type known at apply": {
+			config:  fmt.Sprintf(applyTime, "container") + imagesConfig(`type = terraform_data.t.output`, `gpu_supported = true`),
+			wantErr: `needs type = "vm"`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			resource.UnitTest(t, resource.TestCase{
+				ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+				Steps: []resource.TestStep{{
+					Config:      fakeProviderConfig(endpoint) + tc.config,
+					PlanOnly:    tc.planOnly,
+					ExpectError: regexp.MustCompile(tc.wantErr),
+				}},
+			})
+		})
+	}
+	if len(*agents) != 0 {
+		t.Errorf("%d API calls, want none: invalid config must fail before reading", len(*agents))
+	}
+}
+
+func TestImagesDataSource_nullVariableFilter(t *testing.T) {
+	endpoint, _ := fakeAPI(t)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{{
+			Config: fakeProviderConfig(endpoint) + `
+variable "gpu" {
+  type    = bool
+  default = null
+}
+` + imagesConfig(`type = "container"`, `gpu_supported = var.gpu`),
+			Check: resource.TestCheckResourceAttr("data.hivenet_images.x", "images.#", "1"),
+		}},
+	})
+}
+
+func imagesConfig(args ...string) string {
+	return "data \"hivenet_images\" \"x\" {\n  " + strings.Join(args, "\n  ") + "\n}\n"
+}
+
 func TestDataSources_fakeAPIErrors(t *testing.T) {
 	endpoint, _ := fakeAPI(t)
 	t.Setenv(envToken, "")
@@ -188,6 +328,14 @@ data "hivenet_presets" "all" {}
 data "hivenet_presets" "first_region" {
   region = data.hivenet_regions.all.names[0]
 }
+
+data "hivenet_images" "vm" {
+  type = "vm"
+}
+
+data "hivenet_images" "container" {
+  type = "container"
+}
 `,
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttrWith("data.hivenet_regions.all", "names.#", atLeastOne),
@@ -195,6 +343,9 @@ data "hivenet_presets" "first_region" {
 					resource.TestCheckResourceAttrSet("data.hivenet_presets.all", "presets.0.id"),
 					resource.TestCheckResourceAttrSet("data.hivenet_presets.all", "presets.0.hourly_price"),
 					resource.TestCheckResourceAttrSet("data.hivenet_presets.first_region", "presets.#"),
+					resource.TestCheckResourceAttrWith("data.hivenet_images.vm", "images.#", atLeastOne),
+					resource.TestCheckResourceAttrSet("data.hivenet_images.vm", "images.0.os_family"),
+					resource.TestCheckResourceAttrWith("data.hivenet_images.container", "images.#", atLeastOne),
 				),
 			},
 			{

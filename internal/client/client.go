@@ -104,6 +104,35 @@ type ListPresetsOptions struct {
 	FreeTextSearch string
 }
 
+// Image is an image from GET /images. VM and container images share id, name
+// and type; the other fields are set only for their own type.
+type Image struct {
+	Type string `json:"type"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+
+	OSFamily     string `json:"os_family"`
+	GPUSupported bool   `json:"gpu_supported"`
+	LoginUser    string `json:"login_user"`
+	MinDiskGB    int64  `json:"min_disk_gb"`
+	MinMemoryGB  int64  `json:"min_memory_gb"`
+	SecureBoot   bool   `json:"secure_boot"`
+	TPM          bool   `json:"tpm"`
+
+	SoftwareList []string `json:"software_list"`
+	Registry     string   `json:"registry"`
+	Image        string   `json:"image"`
+	WorkloadType string   `json:"workload_type"`
+	Command      string   `json:"command"`
+	CreatedAt    *string  `json:"created_at"`
+}
+
+// ListImagesOptions selects the images ListImages returns.
+type ListImagesOptions struct {
+	Type string // "vm" or "container"
+	Mine bool   // container only: the caller's saved templates
+}
+
 // APIError is the API's error envelope plus the HTTP status.
 type APIError struct {
 	StatusCode int
@@ -182,6 +211,25 @@ func (c *Client) ListPresets(ctx context.Context, opts ListPresetsOptions) ([]Pr
 	setIf(q, "sku", opts.SKU)
 	setIf(q, "free_text_search", opts.FreeTextSearch)
 	return listAll[Preset](ctx, c, "/presets", q)
+}
+
+// ListImages returns every image of one type.
+func (c *Client) ListImages(ctx context.Context, opts ListImagesOptions) ([]Image, error) {
+	q := url.Values{"type": {opts.Type}}
+	if opts.Type != "container" {
+		// VM images come in one page, and the API refuses size and cursor.
+		var page struct {
+			Data []Image `json:"data"`
+		}
+		if err := c.do(ctx, http.MethodGet, "/images?"+q.Encode(), &page); err != nil {
+			return nil, err
+		}
+		return page.Data, nil
+	}
+	if opts.Mine {
+		q.Set("mine", "true")
+	}
+	return listAll[Image](ctx, c, "/images", q)
 }
 
 // listAll follows the cursor of a paginated list endpoint to the last page.
